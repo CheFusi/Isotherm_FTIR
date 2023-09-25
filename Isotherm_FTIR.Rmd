@@ -1,0 +1,1301 @@
+## Installing Packages
+
+```{r}
+
+# #if (!require("remotes")) install.packages("remotes")
+# #remotes::install_github("philipp-baumann/simplerspec")
+# 
+# #Info on package: 
+#   #https://github.com/philipp-baumann/simplerspec/ & 
+#   #https://github.com/philipp-baumann/simplerspec-read-filter-transform/blob/master/README.Rmd 
+# 
+# install.packages(c("simplerspec","ggfortify"))
+# library(devtools)
+# install_github("vqv/ggbiplot")
+# #library(simplerspec)
+# # Simplerspec is a universal file reader that allows one to read selected parameters instrument, optic and acquisition parameters)
+# 
+
+```
+
+```{r}
+library(readxl)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(ggfortify)
+library(tibble)
+library(here)
+library(ggbiplot)
+library(goeveg)
+library(reshape2)
+```
+
+```{r}
+files <- list.files("Oxidized_Isotherm_Spectra/2023_03_13", full.names = TRUE)
+str(files)
+```
+
+The object `files` has the data structure *atomic vector*. *Atomic vectors* have six possible basic (*atomic*) vector types. These are *logical*, *integer*, *real*, *complex*, *string* (or *character*) and *mir*. Vector types can be returned by the R base function `typeof(x)`, which returns the type or internal storage mode an object `x`. For the `files` object it is
+
+```{r}
+# Check type of files object
+typeof(files)
+```
+
+## Gathering Spectra
+
+-   Took the average of the three scans
+
+-   Created a dataframe (df2) that shows the wavenumber and the average (of 3) absorbances for all samples
+
+```{r}
+
+the_names<- data.frame(list.files(path="Oxidized_Isotherm_Spectra/2023_03_13", pattern="*.CSV", full.names=TRUE)) 
+
+colnames(the_names)=("ID")
+
+the_names_1<-the_names%>%
+  mutate(ID=substr(ID, 49,55))
+
+```
+
+## Baseline Correction
+
+creating a list of the different samples to individually correct the baselines
+
+```{r}
+library(hyperSpec)
+```
+
+Perform rubber-band baseline correction for each sample
+
+```{r}
+
+list_1 <- list.files(path="Oxidized_Isotherm_Spectra/2023_03_13", pattern="*.CSV", full.names=TRUE) %>% 
+  lapply(read.csv,header=FALSE,col.names=c("wavenumber","absorbance"))
+
+#Renaming the dataframes in the list
+names(list_1) <- the_names_1$ID
+
+#Removing the portion of the spectra that is inter=fered by the diamond
+
+filtered_list <- lapply(list_1, function(df) {
+  subset(df, wavenumber >= 551.00) #
+})
+
+
+# Create a function to convert a data frame to a hyperSpec object
+convert_to_hyperSpec <- function(df) {
+  wavenumber <- df$wavenumber
+  absorbance <- df$absorbance
+  return(new("hyperSpec",wavelength = wavenumber, spc = absorbance))
+}
+
+# Convert each data frame to a hyperSpec object
+hyperSpec_list <- lapply(filtered_list, convert_to_hyperSpec)
+
+# Perform rubber-band baseline correction for each hyperSpec object
+corrected_hyperSpec_list <- lapply(hyperSpec_list, spc.rubberband,noise = 100, df = 1600)
+
+#Extracting just the wavenumber and absorbance out of the Hyperspec data type 
+extracted_data_list <- lapply(corrected_hyperSpec_list, function(corrected_data) {
+  data_frame<- data.frame(
+    wavenumber= corrected_data@wavelength,
+  absorbance= as.vector(corrected_data@data$spc)
+  )
+  return(data_frame)
+})
+
+#Creating a name to ID each sample
+combined_data_list <- lapply(seq_along(extracted_data_list), function(i) {
+  df <- extracted_data_list[[i]]
+  df <- cbind(Name = paste0("Sample_", i), df)
+  return(df)
+})
+
+# Min Max Normalization
+
+min_max_normalize <- function(df) {
+  min_val <- min(df$absorbance)
+  max_val <- max(df$absorbance)
+  data_frame<- data.frame(
+    wavenumber = df$wavenumber,
+  abs_normalized = (df$absorbance - min_val) / (max_val - min_val)
+  )
+  return(data_frame)
+}
+
+combined_min_max_list <- lapply(extracted_data_list, min_max_normalize)
+
+# Create an empty dataframe with the wavenumbers column
+combined_min_max <- data.frame(wavenumber = combined_min_max_list[[1]]$wavenumber)
+
+# Bind the intensities columns from each dataframe by name
+for (name in names(combined_min_max_list)) {
+  combined_min_max <- cbind(combined_min_max, combined_min_max_list[[name]][, -1])  # Exclude the wavenumbers column
+  colnames(combined_min_max)[ncol(combined_min_max)] <- name
+}
+
+```
+
+```{r}
+
+absorbance <- list.files(path="Oxidized_Isotherm_Spectra/2023_03_13", pattern="*.CSV", full.names=TRUE) %>% 
+  lapply(read.csv,header=FALSE,col.names=c("wavenumber","absorbance")) %>%
+  lapply("[",2) #%>%
+ # reduce(merge,by = c("absorbance"))
+
+
+wavenumber <- list.files(path="Oxidized_Isotherm_Spectra/2023_03_13", pattern="*.CSV", full.names=TRUE) %>% 
+  lapply(read.csv,header=FALSE,col.names=c("wavenumber","absorbance")) %>%
+  lapply("[",1) #%>%
+ # reduce(merge,by = c("absorbance"))
+wavenumber<-wavenumber[[1]]
+
+absorbance<-do.call("cbind", absorbance)
+colnames(absorbance)<-the_names_1[,1]
+
+
+df2<-cbind(wavenumber,absorbance) 
+
+
+#uploading the dataframe with the output variables 
+
+output_vars<-read_excel("IR_Dependent_Variables.xlsx")
+
+```
+
+## Pivoting Dataframe
+
+-   creating wide formatted dataframe (spectra_wide) with ID column giving oxidation condition and feedstock, SSN column giving oxidation condition-feedstock-and replicate number, column with feedstock name (feedstock), and a column for each wavenumber with the corresponding absorbance as the entry
+
+```{r}
+spectra_long<-pivot_longer(df2,c(the_names_1[,1]))
+colnames(spectra_long)[2]<-"SSN"
+colnames(spectra_long)[3]<-"absorbance"
+
+#extracting the feedstock ID and oxidation condition e.g. AK_05
+the_names_2<-as.data.frame(spectra_long$SSN)%>%
+  mutate(ID=substr(spectra_long$SSN, 1,5))%>%
+   mutate(feedstock=substr(spectra_long$SSN, 1,2))
+
+spectra_long$ID<-the_names_2$ID
+spectra_long$feedstock<-the_names_2$feedstock
+
+#pivoting 
+
+spectra_wide<-pivot_wider(spectra_long,names_from="wavenumber",values_from="absorbance")
+
+spectra_wide$ID<-as.factor(spectra_wide$ID)
+spectra_wide$feedstock<-as.factor(spectra_wide$feedstock)
+
+#Coverting to factor types to ease plotting 
+
+spectra_long$SSN<-as.factor(spectra_long$SSN)
+spectra_long$ID<-as.factor(spectra_long$ID)
+spectra_long$feedstock<-as.factor(spectra_long$feedstock)
+
+
+
+write.csv(spectra_wide,"spectra_wide.CSV")
+
+```
+
+```{r}
+
+spectra_long_base<-pivot_longer(combined_min_max, names_to = "SSN", cols = -wavenumber, values_to = "absorbance")
+
+
+#extracting the feedstock ID and oxidation condition e.g. AK_05
+the_names_3<-as.data.frame(spectra_long_base$SSN)%>%
+  mutate(ID=substr(spectra_long_base$SSN, 1,5))%>%
+   mutate(feedstock=substr(spectra_long_base$SSN, 1,2))
+
+spectra_long_base$ID<-the_names_3$ID
+spectra_long_base$feedstock<-the_names_3$feedstock
+#pivoting 
+
+spectra_wide_base<-pivot_wider(spectra_long_base,names_from="wavenumber",values_from="absorbance")
+
+spectra_wide_base$ID<-as.factor(spectra_wide_base$ID)
+spectra_wide_base$feedstock<-as.factor(spectra_wide_base$feedstock)
+
+#Coverting to factor types to ease plotting 
+
+spectra_long_base$SSN<-as.factor(spectra_long_base$SSN)
+spectra_long_base$ID<-as.factor(spectra_long_base$ID)
+spectra_long_base$feedstock<-as.factor(spectra_long_base$feedstock)
+
+```
+
+### Spectral Replicate Agreement
+
+Plot to visualize all spectra
+
+```{r}
+	p <- ggplot(data = spectra_long, aes(x = wavenumber,y = absorbance, color = SSN)) +
+
+    geom_line(size = 0.2) + #, col = "black", alpha = 0.1) +
+
+    ggtitle("Invenios precision check") +
+  
+  	xlim(rev(range(spectra_long$wavenumber))) +
+     
+    ylim(c(-0.25,0.25)) + # Allows negative CV
+  
+    xlab("Wavelength (nm)") +
+  
+    ylab("Absorbance") + 
+
+    theme_bw() +
+    #eliminates background, gridlines, and chart border
+    theme(
+        plot.background = element_blank()
+        ,panel.grid.major = element_blank()
+        ,panel.grid.minor = element_blank()
+    )
+	p <- p + theme(plot.title = element_text(hjust = 0.5))
+
+	p <- p + theme(legend.position = "none")
+	p
+```
+
+```{r}
+	p2 <- ggplot(data = spectra_long_base, aes(x = wavenumber,y = absorbance, color = SSN)) +
+
+    geom_line(size = 0.2) + #, col = "black", alpha = 0.1) +
+
+    ggtitle("Invenios precision check") +
+  
+  	xlim(rev(range(spectra_long$wavenumber))) +
+     
+    ylim(c(-0.25,1.5)) + # Allows negative CV
+  
+    xlab("Wavelength (nm)") +
+  
+    ylab("Absorbance") + 
+
+    theme_bw() +
+    #eliminates background, gridlines, and chart border
+    theme(
+        plot.background = element_blank()
+        ,panel.grid.major = element_blank()
+        ,panel.grid.minor = element_blank()
+    )
+	p2 <- p2 + theme(plot.title = element_text(hjust = 0.5))
+
+	p2 <- p2 + theme(legend.position = "none")
+	p2
+```
+
+```{r}
+AK<- spectra_long_base %>% filter( feedstock == 'AK')
+
+	p4 <- ggplot(data = AK, aes(x = wavenumber,y = absorbance, color= ID, group = SSN)) +
+
+   geom_line (size = 0.5) +
+	  # geom_point(size = 0.2) + #, col = "black", alpha = 0.1) +
+	  
+	    scale_color_manual(values = c("AK_05" = "red", "AK_10" = "blue", "AK_15" = "darkgreen", "AK_20" = "purple", "AK_25" = "brown", "AK_30" = "pink")) +
+
+    ggtitle("AK: Softwood Pellets 550C") +
+  
+  	xlim(rev(range(spectra_long$wavenumber))) +
+     
+    ylim(c(-0.15,1.5)) + # Allows negative CV
+  
+    xlab("Wavelength (nm)") +
+  
+    ylab("Absorbance") + 
+
+    theme_bw() +
+    #eliminates background, gridlines, and chart border
+    theme(
+        plot.background = element_blank()
+        ,panel.grid.major = element_blank()
+        ,panel.grid.minor = element_blank()
+    )
+	p4 <- p4 + theme(plot.title = element_text(hjust = 0.5)) + theme(legend.position = "none")
+	
+	p4
+```
+
+```{r}
+
+spectra_long
+
+AK_long<- spectra_long %>% filter( feedstock == 'AK' & wavenumber>= 551)
+
+	p5 <- ggplot(data = AK_long, aes(x = wavenumber,y = absorbance, color= ID, group = SSN)) +
+
+   geom_line (size = 0.5) +
+	  
+	    scale_color_manual(values = c("AK_05" = "red", "AK_10" = "blue", "AK_15" = "darkgreen", "AK_20" = "purple", "AK_25" = "brown", "AK_30" = "pink")) +
+
+    ggtitle("AK: Softwood Pellets 550C") +
+  
+  	xlim(rev(range(spectra_long$wavenumber))) +
+     
+    ylim(c(-0.10,0.05)) + # Allows negative CV
+  
+    xlab("Wavelength (nm)") +
+  
+    ylab("Absorbance") + 
+
+    theme_bw() +
+    #eliminates background, gridlines, and chart border
+    theme(
+        plot.background = element_blank()
+        ,panel.grid.major = element_blank()
+        ,panel.grid.minor = element_blank()
+    )
+	p5 <- p5 + theme(plot.title = element_text(hjust = 0.5)) + theme(legend.position = "none")
+	
+	p5
+```
+
+```{r}
+
+```
+
+```{r}
+
+path <-getwd()
+ 
+# Create a path for the QC diagnostic plots
+
+path.f <- dir.create(paste0(path,'/Figures'), showWarnings = FALSE)
+
+# Table with replicate spectra found at the path given above
+spectra <- "spectra_wide.CSV"
+
+# Threshold: %CV cutoff to be tolerated; default is 10%
+threshold <- 0.05
+
+
+#inveniosQC <- function(path=path, spectra=spectra, threshold=threshold){
+
+	raw <- spectra_wide   
+
+	# Get CV; but first remove the metadata fields
+
+	rawcv <- raw[,-c(1,3)] %>%
+		
+		group_by(ID,.add = TRUE)%>%
+		
+		summarise_all(cv)
+
+	# Save generated CVs
+	write.csv(rawcv, file =  paste0(path, '/', 'CVs_',spectra), row.names = FALSE)
+
+	# Read it back
+	
+	spec <- read.csv(paste0(path, '/', 'CVs_',spectra))
+
+	#long way to extract just the numeric column names e.g. wavenumbers 
+	
+	wave <- as.numeric(substr(colnames(rawcv[,-1]),1,19))
+
+	colnames(spec) <- c('SSN',wave)
+
+	spec.m <- melt(spec, id = "SSN")
+
+	p0 <- ggplot(data = spec.m, aes(x = as.numeric(as.vector(variable)),y = value*100,group = SSN)) +
+
+    geom_line(size = 0.2, col = "black", alpha = 0.1) +
+
+    ggtitle("Invenios precision check") +
+  
+  	xlim(rev(range(wave))) +
+     
+    ylim(c(-20,100)) + # Allows negative CV
+  
+    xlab("Wavelength (nm)") +
+  
+    ylab("Absorbance Coefficent of Variation - CV (%)") + 
+
+    theme_bw() +
+    #eliminates background, gridlines, and chart border
+    theme(
+        plot.background = element_blank()
+        ,panel.grid.major = element_blank()
+        ,panel.grid.minor = element_blank()
+    )
+	p0 <- p0 + theme(plot.title = element_text(hjust = 0.5))
+
+	p0 <- p0 + theme(legend.position = "none")
+  
+	p0 <-  p0 + geom_hline(yintercept = 20, col = 'red', linetype = 'dotted')
+
+	p0 <- p0 +annotate('text',x = 1950, y = 20, label = 'CV above 20% shows low precision replicates', vjust = -0.5 )
+  
+	p0
+
+	# Get means for the MIR region excluding CO2
+
+	o <-  which(wave>4000 | wave>2350 & wave <2370) + 1
+
+	spec.o <- spec[,-o]
+
+	meancv <- apply(spec.o[,-1],1,mean)
+
+	plot(meancv, ylim = c(0,0.2))
+
+	# Get a list of replicates failing test
+
+	a <- which(meancv > threshold)
+
+	aa <- which(raw[,'SSN'] %in% spec[a, 'SSN'])
+
+	rawd <-  raw[aa]#,-c(2:18)]
+
+	rawd$id <- c(1:nrow(rawd))
+
+	wave <- as.numeric
+	
+
+
+	colnames(rawd) <- c('SSN',wave,'id')
+
+	spec.m <- melt(rawd, id = c("SSN",'id'))
+
+	p0 <- ggplot(data = spec.m, aes(x = as.numeric(as.vector(variable)),y = value,group = id)) +
+
+   	geom_line(size = 0.2, alpha = 0.9,col = 'black') +
+
+   	ggtitle("Invenios precision check -  Failed") +
+  
+ 		xlim(rev(range(wave))) +
+      
+   	 	ylim(range(spec.m$value)) + 
+  
+     	xlab(expression("Wavenumbers cm"^-1)) +
+  
+  		ylab("Absorbance units") + 
+
+    theme_bw() +
+    
+    #eliminates background, gridlines, and chart border
+    theme(
+        plot.background = element_blank()
+        ,panel.grid.major = element_blank()
+        ,panel.grid.minor = element_blank()
+    )
+	p0 <- p0 + theme(plot.title = element_text(hjust = 0.5))
+
+	p0 <- p0 + theme(legend.position = "none")
+
+	p0 <- p0 +  facet_wrap(~Unit, strip.position ='top', scales = "fixed")
+    
+	p0 <- p0 + facet_wrap(SSN ~.)
+
+	p0 <- p0 + theme(plot.title = element_text(hjust = 0.5, size = 12, colour = 'maroon', face = 'bold'))
+
+	p0 <- p0 + theme(axis.text=element_text(size=7),axis.title=element_text(size=8,face="bold"))
+
+	p0
+
+	ggsave(file = paste0(path,'/Figures/','Failed_QC.png'), height = 6, width = 9, p0)
+	
+	aa <- sample(which(raw[,'SSN'] %in% spec[-a, 'SSN']),length(a))
+
+	aa <- which(raw[,'SSN'] %in% raw[aa, 'SSN'])
+
+	rawd <-  raw[aa,-c(2:18)]
+
+	rawd$id <- c(1:nrow(rawd))
+
+	wave <- as.numeric(substr(colnames(rawd[,-c(1,ncol(rawd))]),2,19))
+	
+
+
+	colnames(rawd) <- c('SSN',wave,'id')
+
+	spec.m <- melt(rawd, id = c("SSN",'id'))
+
+	p1 <- ggplot(data = spec.m, aes(x = as.numeric(as.vector(variable)),y = value,group = id)) +
+
+    geom_line(size = 0.2, alpha = 0.9,col = 'black') +
+
+      ggtitle("Invenios precision check - Passed", subtitle = 'Selected handful') +
+  
+  	xlim(rev(range(wave))) +
+      
+    ylim(range(spec.m$value)) + 
+  
+     xlab(expression("Wavenumbers cm"^-1)) +
+  
+  	ylab("Absorbance units") + 
+  	#theme with white background
+    
+    theme_bw() +
+    #eliminates background, gridlines, and chart border
+    theme(
+        plot.background = element_blank()
+        ,panel.grid.major = element_blank()
+        ,panel.grid.minor = element_blank()
+    )
+	p1 <- p1 + theme(plot.title = element_text(hjust = 0.5)) + theme(plot.subtitle = element_text(hjust = 0.5, colour = 'blue'))
+
+	p1 <- p1 + theme(legend.position = "none")
+
+	p1 <- p1 +  facet_wrap(~Unit, strip.position ='top', scales = "fixed")
+    
+	p1 <- p1 + facet_wrap(SSN ~.)
+
+	p1 <- p1 + theme(plot.title = element_text(hjust = 0.5, size = 12, colour = 'blue', face = 'bold'))
+
+	p1 <- p1 + theme(axis.text=element_text(size=7),axis.title=element_text(size=8,face="bold"))
+
+	p1
+
+	ggsave(file = paste0(path,'/Figures/','Passed_QC.png'), height = 6, width = 9, p1)
+	
+	}
+
+
+
+# Run the example
+inveniosQC(path, spectra, 0.1)
+
+
+
+
+
+
+
+
+
+
+
+
+	p0 <- ggplot(data = spectra_long, aes(x = wavenumber,y = value*100,group = ID)) +
+
+    geom_line(size = 0.2, col = "black", alpha = 0.1) +
+
+    ggtitle("Invenios precision check") +
+  
+  	xlim(rev(range(wavenumber))) +
+     
+    ylim(c(-20,100)) + # Allows negative CV
+  
+    xlab("Wavelength (nm)") +
+  
+    ylab("Absorbance Coefficent of Variation - CV (%)") + 
+
+    theme_bw() +
+    #eliminates background, gridlines, and chart border
+    theme(
+        plot.background = element_blank()
+        ,panel.grid.major = element_blank()
+        ,panel.grid.minor = element_blank()
+    )
+	p0 <- p0 + theme(plot.title = element_text(hjust = 0.5))
+
+	p0 <- p0 + theme(legend.position = "none")
+  
+	p0 <-  p0 + geom_hline(yintercept = 20, col = 'red', linetype = 'dotted')
+
+	p0 <- p0 +annotate('text',x = 1950, y = 20, label = 'CV above 20% shows low precision replicates', vjust = -0.5 )
+  
+	p0
+
+
+```
+
+## Preliminary PCA
+
+```{r}
+
+#delete_out<-output_vars[c(1:6),]
+#delete_in<-data.frame(spectra_wide)
+
+#delete_RHS_pca <-prcomp (delete_in[,c(2:length(delete_in))],
+                 #center=TRUE)
+
+tot_pca <- prcomp(spectra_wide[,c(3:length(spectra_wide))],
+                 center=TRUE)
+
+summary(tot_pca)
+```
+
+```{r}
+g <- ggbiplot::ggbiplot(tot_pca, #need to specify which library the command is coming from, gives errors otherwise
+              obs.scale = 1,
+              var.scale = 1 ,
+              groups = spectra_wide$feedstock1,
+              ellipse = TRUE,
+              circle = TRUE,
+              ellipse.prob = 0.68,
+              var.axes=FALSE)
+g
+```
+
+```{r}
+
+
+#tot_pca_plot<-autoplot(tot_pca) #, data=spectra_wide, colour="feedstock1")
+
+#tot_pca_plot
+```
+
+```{r}
+g2 <- ggbiplot::ggbiplot(tot_pca,
+              obs.scale = 1,
+              var.scale = 1 ,
+              groups = spectra_wide$feedstock1,
+              ellipse = FALSE,
+              circle = TRUE,
+              ellipse.prob = 0.68,
+              var.axes=FALSE)+
+  geom_text(aes(label = output_vars$O_C))
+g2
+```
+
+```{r}
+library(downloader)
+```
+
+### Andrew Sila Script
+
+The following is taken from : [link](https://raw.githubusercontent.com/asila/RF_PLS_Ensemble_methods/master/RF_PLS_optimal.R)
+
+```{r}
+
+mir<-spectra_wide[,c(1,3:length(spectra_wide))]
+ref<-output_vars
+m<-round(0.1*nrow(ref))
+test<-sample(1:nrow(ref),m)
+hout<-ref[test,]
+
+wd<-here()
+
+```
+
+Trans function
+
+```{r}
+
+#' Derives first derivative from ab matrix
+#'
+#' @author Andrew Sila \email{asila@cgiar.org}
+
+trans <- function (mir, tr = "derivative", order = 1, gap = 21, plot.spectrogram=FALSE){
+     if (class(as.numeric(colnames(mir))) != "numeric") {
+         stop("Invalid argument: the colnames of 'mir', which should be the waveband positions, are not coercible to class 'numeric'.")
+     }
+    if (as.numeric(colnames(mir)[1]) > as.numeric(colnames(mir)[2])) {
+        test <- mir
+        for (i in 1:nrow(mir)) {
+            test[i, ] <- rev(test[i, ])
+        }
+        colnames(test) <- rev(colnames(test))
+        mir <- test
+        rm(test)
+    }
+    if (class(mir[1]) == "data.frame") { #Fusi update [1]
+        mir <- as.matrix(mir)
+    }
+    #if (class(mir[1]) != "matrix") { #Fusi update [1]
+    #    stop("Invalid argument: 'mir' must be of class 'matrix' or 'data.frame'.")
+    }
+    if (is.na(match(tr, c("derivative", "continuum removed", 
+        "wt")))) {
+        stop("Invalid argument: 'tr' must be 'derivative','continuum removed' or 'wt'")
+    }
+    if (tr == "derivative") {
+        order <- round(order)
+        if (is.na(match(order, c(0:3)))) {
+            stop("Invalid argument: 'order' has to be an integer between 0 and 3.")
+        }
+        gap <- round(gap)
+        if (is.na(match(gap, c(1:30)))) {
+            stop("Invalid argument: 'gap' has be an integer between 1 and 30.")
+        }
+    }
+    if (tr == "derivative") {
+        transdf <- matrix(nrow = nrow(mir), ncol = ncol(mir), dimnames = list(rownames(mir), 
+            colnames(mir)))
+        waveb <- as.numeric(colnames(mir))
+        for (i in 1:nrow(mir)) {
+            transdf[i, ] <- locpoly(waveb, mir[i, ], drv = order, 
+                bandwidth = gap, gridsize = ncol(mir))[[2]]
+        }
+    }
+    if (tr == "continuum removed") {
+        transdf <- matrix(nrow = nrow(mir), ncol = ncol(mir), dimnames = list(rownames(mir), 
+            colnames(mir)))
+        waveb <- as.numeric(colnames(mir))
+        test <- mir
+        for (i in 1:nrow(mir)) {
+            test.1 <- cbind(waveb, test[i, ])
+            test.1 <- sortedXyData(test.1[, 1], test.1[, 2])
+            ch <- chull(test.1)
+            ch.1 <- ch
+            ch <- ch[1:(which(ch == 1))]
+            ch <- sort(ch)
+            ch <- c(ch, ncol(mir))
+            appr.ch <- approx(test.1[ch, ], xout = test.1[, 1], 
+                method = "linear", ties = "mean")
+            cr <- test.1[[2]] - appr.ch[[2]]
+            transdf[i, ] <- cr
+        }
+        transdf <- transdf[, 2:(ncol(mir) - 2)]
+    }
+    if (tr == "wt") {
+        waveb <- as.numeric(colnames(mir))
+        waveb.1024.up <- round(max(waveb))
+        waveb.1024.down <- round(min(waveb))
+        waveb.1024.n <- 1023
+        waveb.1024.step <- (waveb.1024.up - waveb.1024.down)/waveb.1024.n
+        waveb.1024 <- c()
+        waveb.1024[1] <- waveb.1024.down
+        for (i in 2:1024) {
+            waveb.1024[i] <- round(waveb.1024.down + (i - 1) * 
+                waveb.1024.step, 5)
+        }
+        mir.comp <- matrix(nrow = nrow(mir), ncol = length(waveb.1024), 
+            dimnames = list(rownames(mir), waveb.1024))
+        for (i in 1:nrow(mir)) {
+            mir.comp[i, ] <- round(spline(waveb, mir[i, ], method = "natural", 
+                xout = waveb.1024)[[2]], 6)
+        }
+        lev <- 7
+        slo <- 3
+        filte = "haar"
+        transdf <- matrix(nrow = nrow(mir.comp), ncol = 2^lev, 
+            dimnames = list(rownames(mir.comp), paste("WC_", 
+                c(1:2^lev), sep = "")))
+        for (i in 1:nrow(transdf)) {
+            blub <- dwt(mir.comp[i, ], filter = filte)
+            transdf[i, ] <- slot(blub, "W")[[slo]]
+        }
+    }
+  waveb <- as.numeric(colnames(mir))
+  if(plot.spectrogram==TRUE){
+    dev.new(width = 10, height = 7)
+    par(mfrow = c(2, 1))
+    plot(mir[1, ] ~ waveb, type = "l", ylim = c(min(mir), max(mir)), 
+        xlab = "Wavebands", ylab = "Absorption or Reflection", 
+        main = "mir spectra")
+    for (i in 2:nrow(mir)) {
+        lines(mir[i, ] ~ waveb)
+    }
+  }
+    if (tr != "wt") {
+        waveb <- as.numeric(colnames(transdf))
+        xl = "Wavebands"
+        yl = "Absorption or Reflection"
+    }
+    if (tr == "wt") {
+        waveb <- c(1:128)
+        xl = "Wavelet coefficients from level 3"
+        yl <- "Value wavelet coefficient"
+    }
+    if (tr == "derivative") {
+        te <- "Derivative spectra"
+    }
+    if (tr == "continuum removed") {
+        te <- "Continuum removed spectra"
+    }
+    if (tr == "wt") {
+        te <- "Wavelet transformed spectra"
+    }
+  if(plot.spectrogram==TRUE){
+    plot(transdf[1, ] ~ waveb, type = "l", ylim = c(min(transdf), 
+        max(transdf)), xlab = xl, ylab = yl, main = te)
+    for (i in 2:nrow(mir)) {
+        lines(transdf[i, ] ~ waveb)
+    }
+  }
+    output <- list(mir = mir, trans = transdf, transformation = tr)
+    class(output) <- "trans"
+    return(output)
+
+
+```
+
+RF PLS Ensemble Method
+
+```{r}
+
+calibrate <- function(wd,infrared.data,reference.data,hout,method = c("RF","PLS"),process = c("none","derivative", "msc", "snv","detrend")){
+
+
+  # PLS Regression method
+  # ----------------------------------------------------------------
+  if(method ==  "PLS"){
+  	
+  	setwd(wd)
+  	
+  	mir <- infrared.data
+  	
+  	ref <- reference.data
+  	
+  	  # set preprocessing methods.
+    # set preprocessing methods.
+  
+  if(process == "none"){
+  	
+  	#0. Raw
+	raw <- mir
+		
+	colnames(raw)<-c("SSN",colnames(raw[,-1]))
+	
+	write.table(raw,file= paste0( process, " processed spectra.csv"),sep=",",row.names=FALSE) # same as what was read, creates a duplicate!
+	}
+
+  	
+  	  	#5. First derivative
+  	
+  	mir1 <- as.matrix(mir[,-1])
+  
+  	wave <- as.numeric(substr(colnames(mir1),2,19))
+  
+  	prefx <- substr(colnames(mir1),1,1)[900]
+  	
+  	colnames(mir1) <- wave
+  
+  	if(process == "derivative"){
+  
+  	de1 <- trans(mir1,tr = "derivative",order = 1,gap = 23)
+  
+  	der1 <- rev(as.data.frame(de1$trans))
+  
+  	colnames(der1) <- paste0(prefx,wave)
+  
+  # Save derivative spectra.
+  der1.ssn <- as.data.frame(cbind(as.vector(mir[,1]),der1))
+  
+  colnames(der1.ssn) <- c("SSN",colnames(der1))
+  
+  write.table(der1.ssn,file = paste0( process, " processed spectra.csv"),sep = ",",row.names = FALSE)
+  	} 
+  	
+  	 # Use preprocessed table
+  
+  der1.ssn<-as.data.frame(read_csv(paste0( process, " processed spectra.csv")))
+  
+  # Merge with first derivative preprocessed spectra.
+  
+  	ref.mir <- merge(ref,der1.ssn,by.x = "SSN",by.y = "SSN")
+	
+  	rc <- colnames(ref)
+  	
+  	#which columns contains reference data?
+  	
+  	ref<-ref.mir[,rc]
+  	
+  	#Extract spectral predictors
+  	
+  	mirp<-colnames(der1.ssn)[-1]
+  	
+  	spectra<-ref.mir[,mirp]
+  	
+  	#Create two new subfolders within the current working using:
+  	
+  	b<-getwd()
+  	
+  	if(!file.exists("Models")){dir.create("Models")}
+  	
+  	if(!file.exists("calibration_plots")){dir.create("calibration_plots")}
+  	
+  	# Fit calibration models for the training set and
+  	
+  	# use the testing set to validate the models
+  	  	
+  	set.seed(67523)
+  	
+  	testing <- which(ref.mir$SSN%in%hout$SSN) #with hout
+  	
+  	#Use Kennard_Stone.
+  	
+  	# This is an optional step just to show distribution of spectra in a PCA space.
+  	
+  	sel <- kenStone(spectra,k = round(0.33*nrow(spectra)),pc = .99)
+  	
+  	
+  	# To view selected samples, remove "#" below two lines to plot
+  	
+  	# plot(sel$pc[,1:2],xlab = 'PC1',ylab = 'PC2')
+  	
+  	# points(sel$pc[sel$model,1:2],pch = 19,col = 2)
+  	
+  	# points selected for calibration
+  	
+  	#Loop for calibration of all soil properties in the reference set starts here
+  	
+	msummary <- NULL
+	
+	hd <- colnames(ref)[-1]
+	
+	for (q in 1:length(hd)){
+		
+		refq <- which(colnames(ref)%in%hd[q])
+		
+		ref.q <- ref[,refq]
+		
+		pms.a <- NULL
+		
+		pred.all <- NULL
+		
+		cal <- cbind(as.vector(ref.q),spectra)[-testing,]
+		
+		val <- cbind(as.vector(ref.q),spectra)[testing,]
+		
+		colnames(cal) <- c(colnames(ref)[refq],colnames(spectra))
+		
+		colnames(val) <- colnames(cal)
+		
+		cal <- na.omit(cal)
+		
+		val <- na.omit(val)
+		
+		trainX <- cal[, -1]
+		
+		set.seed(100)
+		
+		colnames(cal) <- c("trainY", colnames(trainX))
+		
+		cal[,"trainY"] <- log(cal[,"trainY"])
+	
+		indx <- createFolds(cal[,"trainY"], returnTrain = TRUE)
+		
+		ctrl <- trainControl(method = "cv", index = indx)
+		
+		rf.m <- train(trainY~., method = "pls", data = cal,trControl =
+		
+		ctrl,tuneGrid = expand.grid(ncomp = 1:10),metric = "RMSE",preProc = 
+		
+		c("center", "scale"))
+		
+		# Get final model to compute coefficient for variation explained
+		
+		predi <- exp(predict(rf.m,rf.m$trainingData))
+		
+		y <- exp(cal[,"trainY"])
+		
+		#computes RMSE and R-squared values for the calibration set
+
+		training.parameters <- round(postResample(predi,y),3)
+		
+		RSQ <- training.parameters[2]
+		
+		RMSE <- training.parameters[1]
+		
+		# Predict qth soil property of the holdoutset using
+		
+		# the MIR data and compare with the actual measurement
+		
+		predi.test <- exp(predict(rf.m,val[,-1]))
+		
+		y.test <- val[,1]
+		
+		#Get PCs used
+		
+		PCs <- rf.m$finalModel$ncomp
+		
+		#computes RMSE and R-squared values for the validation set
+
+		testing.parameters <- round(postResample(predi.test,y.test),2)
+		
+		RSP <- testing.parameters[2]
+		
+		RMSEP <- testing.parameters[1]
+		
+		model.summary <- c(hd[q],PCs,training.parameters,testing.parameters)
+		
+		msummary <- rbind(msummary,model.summary)
+		
+		saveRDS(rf.m,file = paste0(b,"/","models/",hd[q],".rds"))
+		
+		pm <- as.data.frame(cbind(y,predi))
+		
+		colnames(pm) <- c("measured","predicted")
+		
+		# Create scatter plot for the predicted versus the measured - training data set
+		
+		p <- ggplot(pm, aes(x = measured,y = predicted)) + 
+		
+		geom_point(col = "black",size = 2,alpha = 0.3) + 
+		
+		ggtitle(paste0("Calibration for ",hd[q])) + 
+		
+		xlab("Measured") + 
+		
+		ylab("Predicted")
+		
+		p <- p + stat_smooth(method = lm, se = FALSE, color = 'black',alpha = 0.15)
+		
+		p <- p + theme(plot.title = element_text(lineheight = 3, face = "bold",
+		
+		color = "black", size = 20))
+		
+		 # this will change all text size 
+		
+		p <- p + theme(text = element_text(size = 20))
+		
+		p <- p + annotate('text', label = paste('R^2 == ',RSQ),
+		
+		parse = TRUE,Inf, -Inf,hjust = 2.5, vjust = -7.8)  + 
+		
+		annotate('text', label = paste('RMSE == ',RMSE), 
+		
+		parse = TRUE,Inf, -Inf,hjust = 1.8, vjust = -6.4)
+		
+		# Centre title
+		
+      	p <- p + theme(plot.title = element_text(hjust  = 0.5))
+      	
+      	p <- p + xlim(range(pm)) + ylim(range(pm))
+      
+		#Validation data
+		
+		pmp <- as.data.frame(cbind(y.test,predi.test))
+		
+		colnames(pmp)<-c("measured.test","predicted.test")
+		
+		# Create scatter plot for the predicted versus the measured
+		
+		# the validation set
+		
+		p2 <- ggplot(pmp, aes(x = measured.test,y = predicted.test)) + 
+		
+		geom_point(col = "brown",size = 2,alpha = 0.3) + 
+		
+		ggtitle(paste0("Validation for ",hd[q])) + 
+		
+		xlab("Measured") + 
+		
+		ylab("Predicted")
+		
+		p2 <- p2 + stat_smooth(method = lm, se = FALSE, color = 'brown',
+		
+		alpha = 0.15)
+		
+		p2 <- p2 + theme(plot.title = element_text(lineheight = 3,
+		
+		face = "bold", color = "black", size = 20))
+		
+		# this will change all text size 
+		
+		p2 <- p2 + theme(text = element_text(size = 20))
+	
+		p2 <- p2 + annotate('text', label = paste('R^2 == ',RSP),
+		
+		parse = TRUE,Inf, -Inf,hjust = 2.5, vjust = -7.8)  +
+		
+		annotate('text', label = paste('RMSE == ',RMSEP),
+		
+		parse = TRUE,Inf, -Inf,hjust = 1.8, vjust = -6.4)
+		
+		# Centre title
+      	p2 <- p2 + theme(plot.title = element_text(hjust  = 0.5))
+      	
+      	p2 <- p2 + xlim(range(pmp)) + ylim(range(pmp))
+
+		# Save calibration and validation plots
+		png(file = paste0(b,"/Calibration_plots/",hd[q],".png"),
+		
+		height = 400,width = 800)
+		
+		grid.arrange(p,p2,nrow = 1)
+		
+		dev.off()
+		
+	}
+	
+	#colnames(msummary) <- c("Soil_properties","PCs","LOOCV_RMSEC",
+      
+      #"LOOCV_Rsquared", "Holdout_RMSEP","Holdout_Rsquared")
+      
+      write.table(msummary,file = "Model_Summary.csv",sep = ",",row.names = FALSE)
+      
+      # All Samples
+      
+      b<-getwd()
+      
+      if(!file.exists("Full_Models")){dir.create("Full_Models")}
+      
+      if(!file.exists("Full_calibration_plots")){dir.create("Full_calibration_plots")}
+      
+      # Begin calibration 
+      
+      msummary<-NULL
+      
+      hd<-colnames(ref[,-1])#Exclude SSN 
+      
+      all.predicted<-NULL
+      
+      for (q in 1:length(hd)) {
+      	
+      	refq<-which(colnames(ref)%in%hd[q])
+      	
+      	ref.q<-ref[,refq]
+      	
+      	cal<-cbind(as.vector(ref.q),spectra)
+      	
+      	cal<-na.omit(cal)
+      	
+      	trainX <-cal[, -1]
+      	
+      	colnames (cal) <- c("trainY",colnames(trainX))
+      	
+      	cal[,"trainY"] <-log(cal[,"trainY"])
+      	
+      	#colnames(cal)<-c(colnames(ref)[refq],colnames(spectra))
+      	
+      	p<-which(is.na(der1.ssn[,1]) == TRUE)
+      	
+      	ifelse(length(p)>0,ssn<-der1.ssn[-p,1],ssn <- der1.ssn[,1])
+      	
+      	ifelse(length(p)>0,der1.ssn<-der1.ssn[-p,],der1.ssn<-der1.ssn)
+      	
+      	#Select training and testing sets
+      	
+      	set.seed(100)
+      	
+      	indx <- createFolds(cal[,"trainY"], returnTrain = TRUE)
+      	
+      	ctrl <- trainControl(method = "cv", index = indx)
+      	
+      	rf.m <- train(trainY~., method = "pls", data = cal,
+      	
+      	trControl = ctrl,tuneGrid = expand.grid(ncomp = 1:10),
+      	
+      	metric = "RMSE",preProc = c("center", "scale"))
+      	
+      	#Save the model
+      	
+      	saveRDS(rf.m,file = paste0(b,"/","Full_Models/",hd[q],".rds"))
+      	
+      	#Get final model to compute coefficient for variation explained
+      	
+      	predi <- exp(predict(rf.m,rf.m$trainingData))
+      	
+      	y <- exp(cal[,1])
+      	
+      	#Get PCs used
+      	
+      	PCs <- rf.m$finalModel$ncomp
+      	
+      	training.parameters <- c(hd[q],PCs,round(postResample(predi,y),3))
+      	
+      	RSQ <- round(as.numeric(training.parameters[4]),3)
+      	
+      	RMSE <- round(as.numeric(training.parameters[3]),3)
+      	
+      	msummary <- rbind(msummary,training.parameters)
+      	
+      	#Training
+      	
+      	pm <- as.data.frame(cbind(y,predi))
+      	
+      	colnames(pm) <-c ("measured","predicted")
+      	
+      	png(file = paste0(b,"/","Full_calibration_plots/",hd[q],".png"),
+      	
+      	height =  600,width = 600)
+      	
+      	p1 <- ggplot(pm, aes(x = measured,y = predicted)) + 
+      	
+      	geom_point(col = "brown",size = 2,alpha = 0.3) + 
+      	
+      	ggtitle(paste0("Calibration for ",hd[q])) + 
+      	
+      	xlab("Measured") + 
+      	
+      	ylab("Predicted")
+      	
+      	p1 <- p1 + stat_smooth(method = lm, se = FALSE, color = 'brown',
+      	
+      	alpha = 0.15) + 
+      	
+      	theme(plot.title = element_text(lineheight = 3, 
+      	
+      	face = "bold", color = "black", size = 20)) + 
+      	
+      	# this will change all text size 
+
+      	theme(text = element_text(size = 20)) +
+      	
+      	annotate('text', label = paste('R^2 == ',RSQ),
+      	
+      	parse = TRUE,Inf, -Inf,hjust = 2.5, vjust = -7.8,size = 5) +
+      	
+      	annotate('text',label = paste('RMSE == ',RMSE), 
+      	
+      	parse = TRUE,Inf, -Inf,hjust = 2.0, vjust = -6.8,size = 5) + 
+      	
+      	annotate('text', label = paste('PCs == ',PCs), 
+      	
+      	parse = TRUE,Inf, -Inf,hjust = 2.5, vjust = -3.9,size = 5)
+      	
+      	# Centre title
+      	
+      	p1 <- p1 + theme(plot.title = element_text(hjust  = 0.5))
+      	
+      	# Create scatter plot for the predicted versus the measured 
+      	
+      	# the combined dataset
+      	
+      	p1 <- p1 + xlim(range(pm)) + ylim(range(pm))
+
+      	ggsave(file = paste0(b,"/","Full_calibration_plots/",hd[q],".png"),
+      	
+      	height = 6, width = 6, units = "in", p1)
+      	
+      	prediction.f <- round(exp(predict(rf.m,der1.ssn[,-1])),2)
+      	
+      	all.predicted <- cbind(all.predicted,prediction.f)
+      	
+      	}
+      	
+      	#Combine the predicted values together
+      	
+      	all.predicted.SSN <- cbind(as.vector(ssn),all.predicted)
+      	
+      	colnames(all.predicted.SSN) <- c("SSN",hd)
+      	
+      	#colnames(msummary)<-c("Soil_properties","PCs","RMSEC","Rsquared")
+      	
+      	#Save full model summaries
+      	
+      	write.table(msummary, file = "Full models summary.csv",sep = ",",
+      	
+      	row.names = FALSE)
+      	
+      	#Save the linked file
+      	
+      	write.table(all.predicted.SSN, file = "All predictions.csv",
+      	
+      	sep = ",", row.names = FALSE)
+     }
+   }
+
+```
+
+```{r}
+
+mir<-data.frame(spectra_wide[,c(1,3:length(spectra_wide))])
+
+ref<-output_vars
+m<-round(0.1*nrow(ref))
+test<-sample(1:nrow(ref),m)
+hout<-ref[test,]
+
+wd<-here()
+
+#---
+
+
+  	
+#---
+
+calibrate(wd,mir,ref,hout, method="PLS", process="derivative")
+```
+
+```{r}
+
+```
